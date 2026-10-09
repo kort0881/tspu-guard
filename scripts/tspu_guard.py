@@ -8,9 +8,9 @@ import os, json, subprocess, time, socket, ssl, sys, urllib.request, tempfile
 
 TG_TOKEN = os.getenv("TG_TOKEN", "")
 TG_CHAT  = os.getenv("TG_CHAT", "")
-EXPECT_EXIT = os.getenv("EXPECT_EXIT", "201.10.73.218")
-DOMAIN = os.getenv("DOMAIN", "br.rwr-2.top")
-TUNNEL_DOMAIN = os.getenv("TUNNEL_DOMAIN", "t.rwr-2.top")
+EXPECT_EXIT = os.getenv("EXPECT_EXIT", "")
+DOMAIN = os.getenv("DOMAIN", "")
+TUNNEL_DOMAIN = os.getenv("TUNNEL_DOMAIN", "")
 SOCKS = "127.0.0.1:10808"
 
 problems = []
