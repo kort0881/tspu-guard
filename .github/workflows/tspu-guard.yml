@@ -38,6 +38,13 @@ jobs:
       - name: Verify Xray
         run: xray version | head -1
 
+      - name: Install Xray geo assets
+        run: |
+          sudo mkdir -p /usr/local/share/xray
+          sudo curl -fsSL -o /usr/local/share/xray/geosite.dat https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat
+          sudo curl -fsSL -o /usr/local/share/xray/geoip.dat https://github.com/v2fly/geoip/releases/latest/download/geoip.dat
+          ls -l /usr/local/share/xray/
+
       - name: Guard
         env:
           TG_TOKEN:      ${{ secrets.TG_TOKEN }}
