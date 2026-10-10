@@ -38,22 +38,15 @@ jobs:
       - name: Verify Xray
         run: xray version | head -1
 
-      - name: Install dig
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq dnsutils
-
       - name: Guard
         env:
-          TG_TOKEN:          ${{ secrets.TG_TOKEN }}
-          TG_CHAT:           ${{ secrets.TG_CHAT }}
-          CLIENT_JSON:       ${{ secrets.CLIENT_JSON }}
-          DOMAIN:            ${{ secrets.DOMAIN }}
-          EXPECT_EXIT:       ${{ secrets.EXPECT_EXIT }}
-          TUNNEL_DOMAIN:     ${{ secrets.TUNNEL_DOMAIN }}
-          # Опционально: IP:порт DNS-сервера на той стороне туннеля.
-          # Если задан — A-запись проверяется через него, а не через 8.8.8.8.
-          TUNNEL_DNS_SERVER: ${{ secrets.TUNNEL_DNS_SERVER }}
+          TG_TOKEN:      ${{ secrets.TG_TOKEN }}
+          TG_CHAT:       ${{ secrets.TG_CHAT }}
+          CLIENT_JSON:   ${{ secrets.CLIENT_JSON }}
+          DOMAIN:        ${{ secrets.DOMAIN }}
+          EXPECT_EXIT:   ${{ secrets.EXPECT_EXIT }}
+          TUNNEL_DOMAIN: ${{ secrets.TUNNEL_DOMAIN }}
           # Опционально:
+          # SOCKS:         ${{ secrets.SOCKS }}
           # CERT_MIN_DAYS: ${{ secrets.CERT_MIN_DAYS }}
         run: python3 scripts/tspu_guard.py
