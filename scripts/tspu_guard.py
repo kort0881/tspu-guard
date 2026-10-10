@@ -6,12 +6,12 @@
 
 Секреты (Settings → Secrets → Actions):
   TG_TOKEN, TG_CHAT, CLIENT_JSON
-Переменные:
-  DOMAIN, TUNNEL_DOMAIN, EXPECT_EXIT
+  DOMAIN, EXPECT_EXIT, TUNNEL_DOMAIN
 Опционально:
-  SOCKS (по умолчанию 127.0.0.1:10808)
-  XRAY_BIN (по умолчанию xray)
-  CERT_MIN_DAYS (по умолчанию 7)
+  TUNNEL_DNS_SERVER — IP:порт DNS на стороне туннеля (для точной проверки)
+  SOCKS             — по умолчанию 127.0.0.1:10808
+  XRAY_BIN          — по умолчанию xray
+  CERT_MIN_DAYS     — по умолчанию 7
 """
 
 import os
@@ -25,14 +25,15 @@ import tempfile
 import urllib.request
 from datetime import datetime, timezone
 
-TG_TOKEN      = os.getenv("TG_TOKEN", "")
-TG_CHAT       = os.getenv("TG_CHAT", "")
-EXPECT_EXIT   = os.getenv("EXPECT_EXIT", "")
-DOMAIN        = os.getenv("DOMAIN", "")
-TUNNEL_DOMAIN = os.getenv("TUNNEL_DOMAIN", "")
-SOCKS         = os.getenv("SOCKS", "127.0.0.1:10808")
-XRAY_BIN      = os.getenv("XRAY_BIN", "xray")
-CERT_MIN_DAYS = int(os.getenv("CERT_MIN_DAYS", "7"))
+TG_TOKEN          = os.getenv("TG_TOKEN", "")
+TG_CHAT           = os.getenv("TG_CHAT", "")
+EXPECT_EXIT       = os.getenv("EXPECT_EXIT", "")
+DOMAIN            = os.getenv("DOMAIN", "")
+TUNNEL_DOMAIN     = os.getenv("TUNNEL_DOMAIN", "")
+TUNNEL_DNS_SERVER = os.getenv("TUNNEL_DNS_SERVER", "")
+SOCKS             = os.getenv("SOCKS", "127.0.0.1:10808")
+XRAY_BIN          = os.getenv("XRAY_BIN", "xray")
+CERT_MIN_DAYS     = int(os.getenv("CERT_MIN_DAYS", "7"))
 
 problems = []
 
@@ -103,27 +104,39 @@ def check_tunnel() -> None:
         note(False, "не задан TUNNEL_DOMAIN")
         return
 
-    # 1) Делегирование домена через публичный DNS
+    # 1) NS-делегация — информационно. Если её нет, это НЕ проблема:
+    # для поддомена с A-записью NS-записей быть и не должно.
     try:
         ns = _dig(["NS", TUNNEL_DOMAIN, "@8.8.8.8"])
     except Exception as ex:
-        note(False, f"DNS-туннель {TUNNEL_DOMAIN}: {ex}")
+        print(f"INFO dig NS упал: {ex}")
+        ns = ""
+
+    if ns:
+        print(f"INFO NS-делегация: {ns.replace(chr(10), ', ')}")
+        for ns_host in ns.splitlines():
+            ns_host = ns_host.strip().rstrip(".")
+            if not ns_host:
+                continue
+            try:
+                a = _dig(["A", TUNNEL_DOMAIN, f"@{ns_host}"], timeout=15)
+                note(bool(a), f"NS {ns_host} → A {a or 'НЕ отвечает'}")
+            except Exception as ex:
+                note(False, f"NS {ns_host} → ошибка: {ex}")
+    else:
+        print("INFO NS-делегации нет (норма для поддомена)")
+
+    # 2) Основная проверка: резолвится ли домен в A-запись через нужный DNS.
+    # Если задан TUNNEL_DNS_SERVER — спрашиваем его (это и есть проверка
+    # работоспособности DNS-туннеля). Иначе — через публичный 8.8.8.8.
+    resolver = TUNNEL_DNS_SERVER or "8.8.8.8"
+    try:
+        a = _dig(["A", TUNNEL_DOMAIN, f"@{resolver}"], timeout=15)
+    except Exception as ex:
+        note(False, f"DNS-туннель {TUNNEL_DOMAIN}: dig A @{resolver} упал: {ex}")
         return
 
-    note(bool(ns), f"DNS-туннель {TUNNEL_DOMAIN}: NS → {ns or 'НЕ отвечает'}")
-    if not ns:
-        return
-
-    # 2) Каждый NS реально отвечает A-записью
-    for ns_host in ns.splitlines():
-        ns_host = ns_host.strip().rstrip(".")
-        if not ns_host:
-            continue
-        try:
-            a = _dig(["A", TUNNEL_DOMAIN, f"@{ns_host}"], timeout=15)
-            note(bool(a), f"DNS-туннель: {ns_host} → A {a or 'НЕ отвечает'}")
-        except Exception as ex:
-            note(False, f"DNS-туннель: {ns_host} → ошибка: {ex}")
+    note(bool(a), f"DNS-туннель {TUNNEL_DOMAIN} via {resolver} → A {a or 'НЕ отвечает'}")
 
 
 def wait_for_port(host: str, port: int, timeout: float = 15.0) -> bool:
