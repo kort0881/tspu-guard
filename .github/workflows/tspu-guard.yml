@@ -38,6 +38,34 @@ jobs:
       - name: Verify Xray
         run: xray version | head -1
 
+      - name: Debug tunnel DNS
+        env:
+          CLIENT_JSON:   ${{ secrets.CLIENT_JSON }}
+          TUNNEL_DOMAIN: ${{ secrets.TUNNEL_DOMAIN }}
+        run: |
+          echo "$CLIENT_JSON" > /tmp/c.json
+          xray run -c /tmp/c.json > /tmp/xray.log 2>&1 &
+          sleep 6
+
+          echo "--- порт SOCKS ---"
+          ss -lntp | grep 10808 || echo "порт 10808 не слушается"
+          echo "--- хвост лога xray ---"
+          tail -20 /tmp/xray.log || true
+
+          echo "--- curl -v к https://$TUNNEL_DOMAIN через SOCKS ---"
+          curl -v --max-time 20 --socks5-hostname 127.0.0.1:10808 \
+            "https://${TUNNEL_DOMAIN}/" 2>&1 | head -50 || true
+
+          echo "--- для сравнения: резолв $TUNNEL_DOMAIN напрямую ---"
+          getent hosts "${TUNNEL_DOMAIN}" || echo "напрямую не резолвится"
+
+          echo "--- реальный IP через туннель ---"
+          curl -sS --max-time 20 --socks5-hostname 127.0.0.1:10808 \
+            https://api.ipify.org || true
+          echo
+
+          kill %1 2>/dev/null || true
+
       - name: Guard
         env:
           TG_TOKEN:      ${{ secrets.TG_TOKEN }}
@@ -46,7 +74,4 @@ jobs:
           DOMAIN:        ${{ secrets.DOMAIN }}
           EXPECT_EXIT:   ${{ secrets.EXPECT_EXIT }}
           TUNNEL_DOMAIN: ${{ secrets.TUNNEL_DOMAIN }}
-          # Опционально:
-          # SOCKS:         ${{ secrets.SOCKS }}
-          # CERT_MIN_DAYS: ${{ secrets.CERT_MIN_DAYS }}
         run: python3 scripts/tspu_guard.py
