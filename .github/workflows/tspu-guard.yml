@@ -2,31 +2,67 @@ name: tspu-guard
 
 on:
   schedule:
-    - cron: '*/30 * * * *'      # каждые 30 минут
-  workflow_dispatch:            # можно запустить вручную
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tspu-guard
+  cancel-in-progress: true
 
 jobs:
   guard:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
 
-      - name: Установить Xray (пин версии)
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Cache Xray
+        id: cache-xray
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/bin/xray
+          key: xray-26.3.27-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Install Xray
+        if: steps.cache-xray.outputs.cache-hit != 'true'
         run: |
           curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh \
             | sudo bash -s -- install --version 26.3.27
           xray version | head -1
 
-      - name: Установить dig
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq dnsutils
+      - name: Verify Xray
+        run: xray version | head -1
 
-      - name: Сторож
+      - name: Install dig
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq dnsutils
+
+      - name: Guard
+        env:
+          TG_TOKEN:      ${{ secrets.TG_TOKEN }}
+          TG_CHAT:       ${{ secrets.TG_CHAT }}
+          CLIENT_JSON:   ${{ secrets.CLIENT_JSON }}
+          DOMAIN:        ${{ vars.DOMAIN }}
+          EXPECT_EXIT:   ${{ vars.EXPECT_EXIT }}
+          TUNNEL_DOMAIN: ${{ vars.TUNNEL_DOMAIN }}
+          # опционально, если добавляли в скрипт:
+          # CERT_MIN_DAYS: ${{ vars.CERT_MIN_DAYS }}
+        run: python3 scripts/tspu_guard.py
+
+      - name: Notify on crash
+        if: failure() && steps.guard.outcome == 'failure'
         env:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT:  ${{ secrets.TG_CHAT }}
-          CLIENT_JSON: ${{ secrets.CLIENT_JSON }}
-          DOMAIN: ${{ secrets.DOMAIN }}
-          EXPECT_EXIT: ${{ secrets.EXPECT_EXIT }}
-          TUNNEL_DOMAIN: ${{ secrets.TUNNEL_DOMAIN }}
-        run: python3 scripts/tspu_guard.py
+        run: |
+          curl -fsS -X POST \
+            "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+            -d "chat_id=${TG_CHAT}" \
+            -d "parse_mode=HTML" \
+            -d "text=❌ tspu-guard упал до отправки алерта. Проверь логи: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
