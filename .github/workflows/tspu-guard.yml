@@ -48,11 +48,9 @@ jobs:
           TG_TOKEN:      ${{ secrets.TG_TOKEN }}
           TG_CHAT:       ${{ secrets.TG_CHAT }}
           CLIENT_JSON:   ${{ secrets.CLIENT_JSON }}
-          DOMAIN:        ${{ vars.DOMAIN }}
-          EXPECT_EXIT:   ${{ vars.EXPECT_EXIT }}
-          TUNNEL_DOMAIN: ${{ vars.TUNNEL_DOMAIN }}
-          # опционально, если добавляли в скрипт:
-          # CERT_MIN_DAYS: ${{ vars.CERT_MIN_DAYS }}
+          DOMAIN:        ${{ secrets.DOMAIN }}
+          EXPECT_EXIT:   ${{ secrets.EXPECT_EXIT }}
+          TUNNEL_DOMAIN: ${{ secrets.TUNNEL_DOMAIN }}
         run: python3 scripts/tspu_guard.py
 
       - name: Notify on crash
