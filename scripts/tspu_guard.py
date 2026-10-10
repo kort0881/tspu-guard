@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 """
 Сторож контура ТСПУ — запускается из GitHub Actions по расписанию.
-Проверяет: сквозной канал (мост→выход), срок сертификата, DNS-туннель.
-Алертит в Telegram.
+Проверяет: срок сертификата, DNS-туннель (через сам туннель),
+сквозной канал (мост→выход). Алертит в Telegram.
 
 Секреты (Settings → Secrets → Actions):
   TG_TOKEN, TG_CHAT, CLIENT_JSON
   DOMAIN, EXPECT_EXIT, TUNNEL_DOMAIN
 Опционально:
-  TUNNEL_DNS_SERVER — IP:порт DNS на стороне туннеля (для точной проверки)
-  SOCKS             — по умолчанию 127.0.0.1:10808
-  XRAY_BIN          — по умолчанию xray
-  CERT_MIN_DAYS     — по умолчанию 7
+  SOCKS         — по умолчанию 127.0.0.1:10808
+  XRAY_BIN      — по умолчанию xray
+  CERT_MIN_DAYS — по умолчанию 7
 """
 
 import os
@@ -25,15 +24,14 @@ import tempfile
 import urllib.request
 from datetime import datetime, timezone
 
-TG_TOKEN          = os.getenv("TG_TOKEN", "")
-TG_CHAT           = os.getenv("TG_CHAT", "")
-EXPECT_EXIT       = os.getenv("EXPECT_EXIT", "")
-DOMAIN            = os.getenv("DOMAIN", "")
-TUNNEL_DOMAIN     = os.getenv("TUNNEL_DOMAIN", "")
-TUNNEL_DNS_SERVER = os.getenv("TUNNEL_DNS_SERVER", "")
-SOCKS             = os.getenv("SOCKS", "127.0.0.1:10808")
-XRAY_BIN          = os.getenv("XRAY_BIN", "xray")
-CERT_MIN_DAYS     = int(os.getenv("CERT_MIN_DAYS", "7"))
+TG_TOKEN      = os.getenv("TG_TOKEN", "")
+TG_CHAT       = os.getenv("TG_CHAT", "")
+EXPECT_EXIT   = os.getenv("EXPECT_EXIT", "")
+DOMAIN        = os.getenv("DOMAIN", "")
+TUNNEL_DOMAIN = os.getenv("TUNNEL_DOMAIN", "")
+SOCKS         = os.getenv("SOCKS", "127.0.0.1:10808")
+XRAY_BIN      = os.getenv("XRAY_BIN", "xray")
+CERT_MIN_DAYS = int(os.getenv("CERT_MIN_DAYS", "7"))
 
 problems = []
 
@@ -70,7 +68,6 @@ def cert_days(host: str) -> int:
     with socket.create_connection((host, 443), timeout=15) as s:
         with ctx.wrap_socket(s, server_hostname=host) as ss:
             exp = ss.getpeercert()["notAfter"]
-            # notAfter всегда в GMT
             d = datetime.strptime(exp, "%b %d %H:%M:%S %Y %Z").replace(tzinfo=timezone.utc)
             return (d - datetime.now(timezone.utc)).days
 
@@ -86,59 +83,6 @@ def check_cert() -> None:
         note(False, f"сертификат {DOMAIN} не читается: {ex}")
 
 
-def _dig(args: list[str], timeout: int = 20) -> str:
-    try:
-        res = subprocess.run(
-            ["dig", "+short", *args],
-            capture_output=True, text=True, timeout=timeout,
-        )
-        return res.stdout.strip()
-    except FileNotFoundError:
-        raise RuntimeError("утилита dig не найдена (нужен пакет dnsutils)")
-    except subprocess.TimeoutExpired:
-        raise RuntimeError(f"dig таймаут: {' '.join(args)}")
-
-
-def check_tunnel() -> None:
-    if not TUNNEL_DOMAIN:
-        note(False, "не задан TUNNEL_DOMAIN")
-        return
-
-    # 1) NS-делегация — информационно. Если её нет, это НЕ проблема:
-    # для поддомена с A-записью NS-записей быть и не должно.
-    try:
-        ns = _dig(["NS", TUNNEL_DOMAIN, "@8.8.8.8"])
-    except Exception as ex:
-        print(f"INFO dig NS упал: {ex}")
-        ns = ""
-
-    if ns:
-        print(f"INFO NS-делегация: {ns.replace(chr(10), ', ')}")
-        for ns_host in ns.splitlines():
-            ns_host = ns_host.strip().rstrip(".")
-            if not ns_host:
-                continue
-            try:
-                a = _dig(["A", TUNNEL_DOMAIN, f"@{ns_host}"], timeout=15)
-                note(bool(a), f"NS {ns_host} → A {a or 'НЕ отвечает'}")
-            except Exception as ex:
-                note(False, f"NS {ns_host} → ошибка: {ex}")
-    else:
-        print("INFO NS-делегации нет (норма для поддомена)")
-
-    # 2) Основная проверка: резолвится ли домен в A-запись через нужный DNS.
-    # Если задан TUNNEL_DNS_SERVER — спрашиваем его (это и есть проверка
-    # работоспособности DNS-туннеля). Иначе — через публичный 8.8.8.8.
-    resolver = TUNNEL_DNS_SERVER or "8.8.8.8"
-    try:
-        a = _dig(["A", TUNNEL_DOMAIN, f"@{resolver}"], timeout=15)
-    except Exception as ex:
-        note(False, f"DNS-туннель {TUNNEL_DOMAIN}: dig A @{resolver} упал: {ex}")
-        return
-
-    note(bool(a), f"DNS-туннель {TUNNEL_DOMAIN} via {resolver} → A {a or 'НЕ отвечает'}")
-
-
 def wait_for_port(host: str, port: int, timeout: float = 15.0) -> bool:
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -148,6 +92,19 @@ def wait_for_port(host: str, port: int, timeout: float = 15.0) -> bool:
         except OSError:
             time.sleep(0.3)
     return False
+
+
+def curl_socks(url: str, timeout: int = 30) -> tuple[str, str]:
+    """GET через SOCKS5 с удалённым DNS. Возвращает (http_code, stderr_snippet)."""
+    res = subprocess.run(
+        ["curl", "-s", "-o", "/dev/null",
+         "-w", "%{http_code}",
+         "--max-time", str(timeout),
+         "--socks5-hostname", SOCKS,
+         url],
+        capture_output=True, text=True, timeout=timeout + 15,
+    )
+    return res.stdout.strip(), (res.stderr or "").strip()[:200]
 
 
 def check_contour() -> None:
@@ -171,18 +128,26 @@ def check_contour() -> None:
 
         proc = subprocess.Popen(
             [XRAY_BIN, "run", "-c", tmp.name],
-            stdout=log,
-            stderr=subprocess.STDOUT,
+            stdout=log, stderr=subprocess.STDOUT,
         )
 
         host, port = SOCKS.split(":")
         if not wait_for_port(host, int(port), timeout=15):
-            log.flush()
-            log.seek(0)
+            log.flush(); log.seek(0)
             tail = log.read()[-500:].strip()
             note(False, f"xray не поднял SOCKS {SOCKS} за 15с. Лог: {tail[:400]}")
             return
 
+        # 1) DNS-туннель: резолвится ли TUNNEL_DOMAIN ЧЕРЕЗ туннель.
+        #    curl --socks5-hostname резолвит домен на стороне прокси,
+        #    т.е. через ваш xray. Любой HTTP-код кроме 000 = DNS работает.
+        if TUNNEL_DOMAIN:
+            code, err = curl_socks(f"https://{TUNNEL_DOMAIN}/", timeout=20)
+            ok = bool(code) and code != "000"
+            note(ok, f"DNS-туннель {TUNNEL_DOMAIN} через туннель: "
+                     f"HTTP {code or 'нет ответа'}{(' / ' + err) if err and not ok else ''}")
+
+        # 2) Сквозной канал: реальный исходящий IP через туннель.
         res = subprocess.run(
             ["curl", "-s", "--max-time", "30", "--socks5-hostname", SOCKS,
              "https://api.ipify.org"],
@@ -199,20 +164,16 @@ def check_contour() -> None:
             except subprocess.TimeoutExpired:
                 proc.kill()
         log.close()
-        try:
-            os.unlink(tmp.name)
-        except OSError:
-            pass
-        try:
-            os.unlink(log.name)
-        except OSError:
-            pass
+        for path in (tmp.name, log.name):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
 
 
 def main() -> None:
     print("=== сторож контура ТСПУ ===")
     check_cert()
-    check_tunnel()
     check_contour()
 
     if problems:
