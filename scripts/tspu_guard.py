@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
 Сторож контура ТСПУ — запускается из GitHub Actions по расписанию.
-Проверяет: срок сертификата, DNS-туннель (через сам туннель),
-сквозной канал (мост→выход). Алертит в Telegram.
+Проверяет: срок сертификата, доступность DNS-туннеля (резолв + TCP
+через сам туннель), сквозной канал (мост→выход). Алертит в Telegram.
 
 Секреты (Settings → Secrets → Actions):
   TG_TOKEN, TG_CHAT, CLIENT_JSON
   DOMAIN, EXPECT_EXIT, TUNNEL_DOMAIN
 Опционально:
+  TUNNEL_PORT   — порт для проверки DNS-туннеля, по умолчанию 443
   SOCKS         — по умолчанию 127.0.0.1:10808
   XRAY_BIN      — по умолчанию xray
   CERT_MIN_DAYS — по умолчанию 7
@@ -29,6 +30,7 @@ TG_CHAT       = os.getenv("TG_CHAT", "")
 EXPECT_EXIT   = os.getenv("EXPECT_EXIT", "")
 DOMAIN        = os.getenv("DOMAIN", "")
 TUNNEL_DOMAIN = os.getenv("TUNNEL_DOMAIN", "")
+TUNNEL_PORT   = int(os.getenv("TUNNEL_PORT", "443"))
 SOCKS         = os.getenv("SOCKS", "127.0.0.1:10808")
 XRAY_BIN      = os.getenv("XRAY_BIN", "xray")
 CERT_MIN_DAYS = int(os.getenv("CERT_MIN_DAYS", "7"))
@@ -94,13 +96,69 @@ def wait_for_port(host: str, port: int, timeout: float = 15.0) -> bool:
     return False
 
 
+SOCKS_ERRORS = {
+    0x01: "general SOCKS server failure",
+    0x02: "connection not allowed by ruleset",
+    0x03: "network unreachable",
+    0x04: "host unreachable",
+    0x05: "connection refused",
+    0x06: "TTL expired",
+    0x07: "command not supported",
+    0x08: "address type not supported",
+}
+
+
+def socks5_tcp_connect(host: str, port: int, timeout: int = 15) -> tuple[bool, str]:
+    """
+    Проверяет: может ли SOCKS5-прокси (xray) установить TCP-соединение
+    до host:port. DNS-резолв делает сторона прокси (ATYP=domain).
+    Возвращает (ok, сообщение об ошибке).
+    """
+    socks_host, socks_port_s = SOCKS.split(":")
+    socks_port = int(socks_port_s)
+
+    try:
+        s = socket.create_connection((socks_host, socks_port), timeout=timeout)
+    except OSError as ex:
+        return False, f"нет соединения с SOCKS {SOCKS}: {ex}"
+
+    try:
+        s.settimeout(timeout)
+        # Приветствие: SOCKS5, метод 0x00 (no auth)
+        s.sendall(b"\x05\x01\x00")
+        resp = s.recv(2)
+        if len(resp) != 2 or resp[0] != 0x05 or resp[1] != 0x00:
+            return False, f"SOCKS5 greeting failed: {resp!r}"
+
+        # Запрос CONNECT с доменом (ATYP=0x03)
+        host_b = host.encode("idna") if host.isascii() else host.encode("utf-8")
+        if len(host_b) > 255:
+            return False, "домен длиннее 255 байт"
+        req = b"\x05\x01\x00\x03" + bytes([len(host_b)]) + host_b + port.to_bytes(2, "big")
+        s.sendall(req)
+
+        resp = s.recv(10)
+        if len(resp) < 2 or resp[0] != 0x05:
+            return False, f"SOCKS5 ответ мусорный: {resp!r}"
+        code = resp[1]
+        if code != 0x00:
+            return False, SOCKS_ERRORS.get(code, f"код 0x{code:02x}")
+        return True, ""
+    except socket.timeout:
+        return False, "таймаут SOCKS5"
+    except OSError as ex:
+        return False, f"ошибка SOCKS5: {ex}"
+    finally:
+        try:
+            s.close()
+        except OSError:
+            pass
+
+
 def curl_socks(url: str, timeout: int = 30, want_body: bool = False) -> tuple[str, str, str]:
-    """
-    GET через SOCKS5 с удалённым DNS.
-    Возвращает (http_code, body_or_empty, stderr_snippet).
-    """
+    """GET через SOCKS5 с удалённым DNS. -> (http_code, body, stderr)."""
     args = [
-        "curl", "-sS",                 # silent, но показывать ошибки
+        "curl", "-sS",
         "-o", "/dev/stdout" if want_body else "/dev/null",
         "-w", "\n%{http_code}",
         "--max-time", str(timeout),
@@ -109,8 +167,7 @@ def curl_socks(url: str, timeout: int = 30, want_body: bool = False) -> tuple[st
     ]
     res = subprocess.run(args, capture_output=True, text=True, timeout=timeout + 15)
     out = res.stdout or ""
-    code = ""
-    body = ""
+    body, code = "", ""
     if "\n" in out:
         body, _, code = out.rpartition("\n")
         code = code.strip()
@@ -150,18 +207,18 @@ def check_contour() -> None:
             note(False, f"xray не поднял SOCKS {SOCKS} за 15с. Лог: {tail[:400]}")
             return
 
-        # 1) DNS-туннель: резолвится ли TUNNEL_DOMAIN ЧЕРЕЗ туннель.
-        #    --socks5-hostname резолвит домен на стороне xray.
+        # 1) DNS-туннель: резолв + TCP-connect через SOCKS.
         if TUNNEL_DOMAIN:
-            code, _, err = curl_socks(f"https://{TUNNEL_DOMAIN}/", timeout=20)
-            ok = bool(code) and code != "000"
-            msg = f"DNS-туннель {TUNNEL_DOMAIN} через туннель: HTTP {code or 'нет ответа'}"
-            if err and not ok:
-                msg += f" | {err}"
+            ok, err = socks5_tcp_connect(TUNNEL_DOMAIN, TUNNEL_PORT, timeout=15)
+            msg = f"DNS-туннель {TUNNEL_DOMAIN}:{TUNNEL_PORT} через туннель"
+            if ok:
+                msg += " — TCP OK"
+            else:
+                msg += f" — {err}"
             note(ok, msg)
 
         # 2) Сквозной канал: реальный исходящий IP через туннель.
-        code, body, err = curl_socks("https://api.ipify.org", timeout=30, want_body=True)
+        _, body, err = curl_socks("https://api.ipify.org", timeout=30, want_body=True)
         out = body
         ok = (out == EXPECT_EXIT)
         msg = f"сквозной канал: выход={out or 'ПУСТО'} (ожидали {EXPECT_EXIT})"
