@@ -207,17 +207,12 @@ def check_contour() -> None:
             note(False, f"xray не поднял SOCKS {SOCKS} за 15с. Лог: {tail[:400]}")
             return
 
-        # 1) DNS-туннель: резолв + TCP-connect через SOCKS.
-        if TUNNEL_DOMAIN:
-            ok, err = socks5_tcp_connect(TUNNEL_DOMAIN, TUNNEL_PORT, timeout=15)
-            msg = f"DNS-туннель {TUNNEL_DOMAIN}:{TUNNEL_PORT} через туннель"
-            if ok:
-                msg += " — TCP OK"
-            else:
-                msg += f" — {err}"
-            note(ok, msg)
-
-        # 2) Сквозной канал: реальный исходящий IP через туннель.
+        # 1) Сквозной канал: реальный исходящий IP через туннель.
+        #    Это единственная надёжная проверка: если выходной IP совпадает
+        #    с EXPECT_EXIT, значит весь контур (мост→туннель→выход) работает.
+        #    Отдельная проверка DNS-туннеля через TCP убрана: dnstt использует
+        #    UDP:53 + SOCKS:1080, а порт 443 на мосту занят xray xhttp-in
+        #    (VLESS/XHTTP, не TLS), поэтому TCP+TLS к нему всегда падает.
         _, body, err = curl_socks("https://api.ipify.org", timeout=30, want_body=True)
         out = body
         ok = (out == EXPECT_EXIT)
