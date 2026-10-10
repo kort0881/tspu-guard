@@ -94,17 +94,29 @@ def wait_for_port(host: str, port: int, timeout: float = 15.0) -> bool:
     return False
 
 
-def curl_socks(url: str, timeout: int = 30) -> tuple[str, str]:
-    """GET через SOCKS5 с удалённым DNS. Возвращает (http_code, stderr_snippet)."""
-    res = subprocess.run(
-        ["curl", "-s", "-o", "/dev/null",
-         "-w", "%{http_code}",
-         "--max-time", str(timeout),
-         "--socks5-hostname", SOCKS,
-         url],
-        capture_output=True, text=True, timeout=timeout + 15,
-    )
-    return res.stdout.strip(), (res.stderr or "").strip()[:200]
+def curl_socks(url: str, timeout: int = 30, want_body: bool = False) -> tuple[str, str, str]:
+    """
+    GET через SOCKS5 с удалённым DNS.
+    Возвращает (http_code, body_or_empty, stderr_snippet).
+    """
+    args = [
+        "curl", "-sS",                 # silent, но показывать ошибки
+        "-o", "/dev/stdout" if want_body else "/dev/null",
+        "-w", "\n%{http_code}",
+        "--max-time", str(timeout),
+        "--socks5-hostname", SOCKS,
+        url,
+    ]
+    res = subprocess.run(args, capture_output=True, text=True, timeout=timeout + 15)
+    out = res.stdout or ""
+    code = ""
+    body = ""
+    if "\n" in out:
+        body, _, code = out.rpartition("\n")
+        code = code.strip()
+    else:
+        code = out.strip()
+    return code, body.strip(), (res.stderr or "").strip()[:300]
 
 
 def check_contour() -> None:
@@ -139,23 +151,23 @@ def check_contour() -> None:
             return
 
         # 1) DNS-туннель: резолвится ли TUNNEL_DOMAIN ЧЕРЕЗ туннель.
-        #    curl --socks5-hostname резолвит домен на стороне прокси,
-        #    т.е. через ваш xray. Любой HTTP-код кроме 000 = DNS работает.
+        #    --socks5-hostname резолвит домен на стороне xray.
         if TUNNEL_DOMAIN:
-            code, err = curl_socks(f"https://{TUNNEL_DOMAIN}/", timeout=20)
+            code, _, err = curl_socks(f"https://{TUNNEL_DOMAIN}/", timeout=20)
             ok = bool(code) and code != "000"
-            note(ok, f"DNS-туннель {TUNNEL_DOMAIN} через туннель: "
-                     f"HTTP {code or 'нет ответа'}{(' / ' + err) if err and not ok else ''}")
+            msg = f"DNS-туннель {TUNNEL_DOMAIN} через туннель: HTTP {code or 'нет ответа'}"
+            if err and not ok:
+                msg += f" | {err}"
+            note(ok, msg)
 
         # 2) Сквозной канал: реальный исходящий IP через туннель.
-        res = subprocess.run(
-            ["curl", "-s", "--max-time", "30", "--socks5-hostname", SOCKS,
-             "https://api.ipify.org"],
-            capture_output=True, text=True, timeout=45,
-        )
-        out = res.stdout.strip()
-        note(out == EXPECT_EXIT,
-             f"сквозной канал: выход={out or 'ПУСТО'} (ожидали {EXPECT_EXIT})")
+        code, body, err = curl_socks("https://api.ipify.org", timeout=30, want_body=True)
+        out = body
+        ok = (out == EXPECT_EXIT)
+        msg = f"сквозной канал: выход={out or 'ПУСТО'} (ожидали {EXPECT_EXIT})"
+        if err and not ok:
+            msg += f" | {err}"
+        note(ok, msg)
     finally:
         if proc is not None:
             proc.terminate()
