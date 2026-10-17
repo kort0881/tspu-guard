@@ -1,8 +1,10 @@
 name: tspu-guard
 
 on:
-  schedule:
-    - cron: '*/30 * * * *'
+  # Расписание ОТКЛЮЧЕНО: дежурство живёт на серверах (DE: monitor_state.py */5,
+  # watchdog бота */5). GitHub — только ручной запуск для проверки.
+  # schedule:
+  #   - cron: '*/30 * * * *'
   workflow_dispatch:
 
 permissions:

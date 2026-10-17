@@ -35,6 +35,14 @@ SOCKS         = os.getenv("SOCKS", "127.0.0.1:10808")
 XRAY_BIN      = os.getenv("XRAY_BIN", "xray")
 CERT_MIN_DAYS = int(os.getenv("CERT_MIN_DAYS", "7"))
 
+# Независимые источники «какой у меня IP»: сбой одного SNI на DPI не должен
+# выглядеть как падение контура.
+IP_ECHO = [
+    "https://api.ipify.org",
+    "https://icanhazip.com",
+    "https://ifconfig.me/ip",
+]
+
 problems = []
 
 
@@ -213,13 +221,32 @@ def check_contour() -> None:
         #    Отдельная проверка DNS-туннеля через TCP убрана: dnstt использует
         #    UDP:53 + SOCKS:1080, а порт 443 на мосту занят xray xhttp-in
         #    (VLESS/XHTTP, не TLS), поэтому TCP+TLS к нему всегда падает.
-        _, body, err = curl_socks("https://api.ipify.org", timeout=30, want_body=True)
-        out = body
-        ok = (out == EXPECT_EXIT)
-        msg = f"сквозной канал: выход={out or 'ПУСТО'} (ожидали {EXPECT_EXIT})"
-        if err and not ok:
-            msg += f" | {err}"
-        note(ok, msg)
+        # 1) Сквозной канал: реальный исходящий IP через туннель.
+        #    Не срабатываем по пустякам: несколько кругов, в каждом несколько
+        #    независимых IP-эхо. Один DPI-сброс на конкретном SNI или один
+        #    подтормозивший эндпоинт — ещё не повод орать.
+        rounds = int(os.getenv("ROUNDS", "3"))
+        pause = int(os.getenv("ROUND_PAUSE", "12"))
+        last_errs: list[str] = []
+        for rnd in range(1, rounds + 1):
+            for url in IP_ECHO:
+                _, body, err = curl_socks(url, timeout=20, want_body=True)
+                out = body.strip()
+                host = url.split("//", 1)[1]
+                if out == EXPECT_EXIT:
+                    note(True, f"сквозной канал: выход={EXPECT_EXIT} ({host}, круг {rnd}/{rounds})")
+                    return
+                if out:
+                    last_errs.append(f"{host}: вышел {out}, ожидали {EXPECT_EXIT}")
+                else:
+                    last_errs.append(f"{host}: {err or 'пустой ответ'}")
+                time.sleep(1)
+            print(f"     круг {rnd}/{rounds} без успеха", flush=True)
+            if rnd < rounds:
+                time.sleep(pause)
+
+        note(False, f"сквозной канал: выход=ПУСТО после {rounds} кругов по {len(IP_ECHO)} эхо "
+                    f"(ожидали {EXPECT_EXIT}) | " + "; ".join(last_errs[-3:]))
     finally:
         if proc is not None:
             proc.terminate()
