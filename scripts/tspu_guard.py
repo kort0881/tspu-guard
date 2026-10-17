@@ -185,6 +185,13 @@ def curl_socks(url: str, timeout: int = 30, want_body: bool = False) -> tuple[st
 
 
 def check_contour() -> None:
+    # Контур может быть выключен НАМЕРЕННО (тест, пауза, трастовый прогон).
+    # В этом случае сторож молчит: держим рубильник в переменной репозитория
+    # CONTOUR_OFF=1. Вернуть проверку — CONTOUR_OFF=0 (или удалить переменную).
+    if os.getenv("CONTOUR_OFF", "0").strip() == "1":
+        print("     контур выключен намеренно (CONTOUR_OFF=1) — сквозную проверку пропускаем", flush=True)
+        return
+
     cfg = os.getenv("CLIENT_JSON", "")
     if not cfg:
         note(False, "не задан CLIENT_JSON (клиентский конфиг в секретах)")

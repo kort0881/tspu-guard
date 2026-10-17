@@ -53,5 +53,6 @@ jobs:
           DOMAIN:        ${{ secrets.DOMAIN }}
           EXPECT_EXIT:   ${{ secrets.EXPECT_EXIT }}
           TUNNEL_DOMAIN: ${{ secrets.TUNNEL_DOMAIN }}
+          CONTOUR_OFF:   ${{ vars.CONTOUR_OFF }}   # 1 = контур выключен намеренно, сквозную проверку не делаем
           # TUNNEL_PORT: ${{ vars.TUNNEL_PORT }}   # если порт не 443
         run: python3 scripts/tspu_guard.py
