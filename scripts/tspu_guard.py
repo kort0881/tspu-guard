@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
 Сторож контура ТСПУ — запускается из GitHub Actions по расписанию.
-Проверяет: срок сертификата, доступность DNS-туннеля (резолв + TCP
-через сам туннель), сквозной канал (мост→выход). Алертит в Telegram.
+Проверяет: срок сертификата, сквозной канал (мост→выход) через SOCKS.
+При падении канала — триада диагностики (TCP-через-SOCKS, direct,
+plain-HTTP, TLS 1.2) и хвост лога xray в алерте.
 
 Секреты (Settings → Secrets → Actions):
   TG_TOKEN, TG_CHAT, CLIENT_JSON
@@ -12,6 +13,9 @@
   SOCKS         — по умолчанию 127.0.0.1:10808
   XRAY_BIN      — по умолчанию xray
   CERT_MIN_DAYS — по умолчанию 7
+  ROUNDS        — кругов по эхо при проверке канала, по умолчанию 3
+  ROUND_PAUSE   — пауза между кругами, сек, по умолчанию 12
+  CONTOUR_OFF   — 1 = пропустить сквозную проверку (рубильник)
 """
 
 import os
@@ -116,7 +120,7 @@ SOCKS_ERRORS = {
 }
 
 
-def socks5_tcp_connect(host: str, port: int, timeout: int = 15) -> tuple[bool, str]:
+def socks5_tcp_connect(host: str, port: int, timeout: int = 8) -> tuple[bool, str]:
     """
     Проверяет: может ли SOCKS5-прокси (xray) установить TCP-соединение
     до host:port. DNS-резолв делает сторона прокси (ATYP=domain).
@@ -132,13 +136,11 @@ def socks5_tcp_connect(host: str, port: int, timeout: int = 15) -> tuple[bool, s
 
     try:
         s.settimeout(timeout)
-        # Приветствие: SOCKS5, метод 0x00 (no auth)
         s.sendall(b"\x05\x01\x00")
         resp = s.recv(2)
         if len(resp) != 2 or resp[0] != 0x05 or resp[1] != 0x00:
             return False, f"SOCKS5 greeting failed: {resp!r}"
 
-        # Запрос CONNECT с доменом (ATYP=0x03)
         host_b = host.encode("idna") if host.isascii() else host.encode("utf-8")
         if len(host_b) > 255:
             return False, "домен длиннее 255 байт"
@@ -163,31 +165,77 @@ def socks5_tcp_connect(host: str, port: int, timeout: int = 15) -> tuple[bool, s
             pass
 
 
-def curl_socks(url: str, timeout: int = 30, want_body: bool = False) -> tuple[str, str, str]:
-    """GET через SOCKS5 с удалённым DNS. -> (http_code, body, stderr)."""
-    args = [
-        "curl", "-sS",
-        "-o", "/dev/stdout" if want_body else "/dev/null",
-        "-w", "\n%{http_code}",
-        "--max-time", str(timeout),
-        "--socks5-hostname", SOCKS,
-        url,
-    ]
-    res = subprocess.run(args, capture_output=True, text=True, timeout=timeout + 15)
+def _curl(url: str, prefix: list[str], timeout: int, want_body: bool,
+          tls_max: str | None = None) -> tuple[str, str, str]:
+    """Общий раннер curl. -> (http_code, body, stderr)."""
+    args = ["curl", "-sS",
+            "-o", "/dev/stdout" if want_body else "/dev/null",
+            "-w", "\n%{http_code}",
+            "--max-time", str(timeout),
+            "--connect-timeout", "5"]
+    if tls_max:
+        args += ["--tls-max", tls_max]
+    args += prefix
+    args.append(url)
+    try:
+        res = subprocess.run(args, capture_output=True, text=True, timeout=timeout + 15)
+    except subprocess.TimeoutExpired:
+        return "000", "", "curl timeout (subprocess)"
     out = res.stdout or ""
-    body, code = "", ""
     if "\n" in out:
         body, _, code = out.rpartition("\n")
-        code = code.strip()
     else:
-        code = out.strip()
-    return code, body.strip(), (res.stderr or "").strip()[:300]
+        body, code = "", out
+    return code.strip(), body.strip(), (res.stderr or "").strip()[:300]
+
+
+def curl_socks(url: str, timeout: int = 30, want_body: bool = False,
+               tls_max: str | None = None) -> tuple[str, str, str]:
+    """GET через SOCKS5 с удалённым DNS. -> (http_code, body, stderr)."""
+    return _curl(url, ["--socks5-hostname", SOCKS], timeout, want_body, tls_max)
+
+
+def curl_direct(url: str, timeout: int = 10, want_body: bool = True,
+                tls_max: str | None = None) -> tuple[str, str, str]:
+    """GET без прокси, только IPv4. Базовая линия «есть ли у раннера инет»."""
+    return _curl(url, ["-4"], timeout, want_body, tls_max)
+
+
+def diag_tunnel() -> str:
+    """
+    Быстрая триада, чтобы отличить «туннель мёртв» от «TLS режут»:
+      1) TCP :443 через SOCKS — идёт ли трафик в принципе;
+      2) direct (без SOCKS)    — жив ли собственный интернет раннера;
+      3) plain HTTP через SOCKS — пропускает ли туннель не-TLS;
+      4) TLS 1.2 через SOCKS    — режут ли только TLS 1.3/fingerprint.
+    """
+    parts: list[str] = []
+
+    ok, err = socks5_tcp_connect("api.ipify.org", 443, timeout=8)
+    parts.append("socks-tcp:443 OK (TCP идёт, режут TLS)"
+                 if ok else f"socks-tcp:443 FAIL ({err[:70]})")
+
+    code, body, err = curl_direct("https://api.ipify.org", timeout=8)
+    parts.append(f"direct OK ({body[:40]})"
+                 if code == "200" and body
+                 else f"direct FAIL ({err[:70] or 'code ' + code})")
+
+    code, body, err = curl_socks("http://api.ipify.org", timeout=8, want_body=True)
+    parts.append("tunnel-http OK (туннель жив, режут TLS)"
+                 if code == "200" and body
+                 else f"tunnel-http FAIL ({err[:70] or 'code ' + code})")
+
+    code, body, err = curl_socks("https://api.ipify.org", timeout=10,
+                                 want_body=True, tls_max="1.2")
+    parts.append("tunnel-tls1.2 OK (режут именно TLS 1.3)"
+                 if code == "200" and body
+                 else f"tunnel-tls1.2 FAIL ({err[:70] or 'code ' + code})")
+
+    return " || ".join(parts)
 
 
 def check_contour() -> None:
     # Контур может быть выключен НАМЕРЕННО (тест, пауза, трастовый прогон).
-    # В этом случае сторож молчит: держим рубильник в переменной репозитория
-    # CONTOUR_OFF=1. Вернуть проверку — CONTOUR_OFF=0 (или удалить переменную).
     if os.getenv("CONTOUR_OFF", "0").strip() == "1":
         print("     контур выключен намеренно (CONTOUR_OFF=1) — сквозную проверку пропускаем", flush=True)
         return
@@ -206,6 +254,7 @@ def check_contour() -> None:
     tmp = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8")
     log = tempfile.NamedTemporaryFile("w+", suffix=".log", delete=False, encoding="utf-8")
     proc = None
+    contour_failed = False
     try:
         tmp.write(cfg)
         tmp.close()
@@ -215,23 +264,16 @@ def check_contour() -> None:
             stdout=log, stderr=subprocess.STDOUT,
         )
 
-        host, port = SOCKS.split(":")
-        if not wait_for_port(host, int(port), timeout=15):
+        socks_host, socks_port_s = SOCKS.split(":")
+        if not wait_for_port(socks_host, int(socks_port_s), timeout=15):
             log.flush(); log.seek(0)
             tail = log.read()[-500:].strip()
             note(False, f"xray не поднял SOCKS {SOCKS} за 15с. Лог: {tail[:400]}")
             return
 
-        # 1) Сквозной канал: реальный исходящий IP через туннель.
-        #    Это единственная надёжная проверка: если выходной IP совпадает
-        #    с EXPECT_EXIT, значит весь контур (мост→туннель→выход) работает.
-        #    Отдельная проверка DNS-туннеля через TCP убрана: dnstt использует
-        #    UDP:53 + SOCKS:1080, а порт 443 на мосту занят xray xhttp-in
-        #    (VLESS/XHTTP, не TLS), поэтому TCP+TLS к нему всегда падает.
-        # 1) Сквозной канал: реальный исходящий IP через туннель.
-        #    Не срабатываем по пустякам: несколько кругов, в каждом несколько
-        #    независимых IP-эхо. Один DPI-сброс на конкретном SNI или один
-        #    подтормозивший эндпоинт — ещё не повод орать.
+        # Сквозной канал: реальный исходящий IP через туннель.
+        # Несколько кругов по несколько независимых IP-эхо — один DPI-сброс
+        # на конкретном SNI ещё не повод орать.
         rounds = int(os.getenv("ROUNDS", "3"))
         pause = int(os.getenv("ROUND_PAUSE", "12"))
         last_errs: list[str] = []
@@ -239,22 +281,36 @@ def check_contour() -> None:
             for url in IP_ECHO:
                 _, body, err = curl_socks(url, timeout=20, want_body=True)
                 out = body.strip()
-                host = url.split("//", 1)[1]
+                ep_host = url.split("//", 1)[1]
                 if out == EXPECT_EXIT:
-                    note(True, f"сквозной канал: выход={EXPECT_EXIT} ({host}, круг {rnd}/{rounds})")
+                    note(True, f"сквозной канал: выход={EXPECT_EXIT} ({ep_host}, круг {rnd}/{rounds})")
                     return
                 if out:
-                    last_errs.append(f"{host}: вышел {out}, ожидали {EXPECT_EXIT}")
+                    last_errs.append(f"{ep_host}: вышел {out}, ожидали {EXPECT_EXIT}")
                 else:
-                    last_errs.append(f"{host}: {err or 'пустой ответ'}")
+                    last_errs.append(f"{ep_host}: {err or 'пустой ответ'}")
                 time.sleep(1)
             print(f"     круг {rnd}/{rounds} без успеха", flush=True)
             if rnd < rounds:
                 time.sleep(pause)
 
-        note(False, f"сквозной канал: выход=ПУСТО после {rounds} кругов по {len(IP_ECHO)} эхо "
-                    f"(ожидали {EXPECT_EXIT}) | " + "; ".join(last_errs[-3:]))
+        diag = diag_tunnel()
+        note(False,
+             f"сквозной канал: выход=ПУСТО после {rounds} кругов по {len(IP_ECHO)} эхо "
+             f"(ожидали {EXPECT_EXIT}) | " + "; ".join(last_errs[-3:])
+             + " || diag: " + diag)
+        contour_failed = True
     finally:
+        # Если канал упал — приложим хвост лога xray (там виден отказ аплинка,
+        # xhttp handshake error, dial tcp timeout и т.п.).
+        if contour_failed:
+            try:
+                log.flush(); log.seek(0)
+                tail = log.read()[-800:].strip()
+            except Exception:
+                tail = ""
+            if tail:
+                problems.append("xray: " + tail.replace("\n", " ⏎ ")[:600])
         if proc is not None:
             proc.terminate()
             try:
