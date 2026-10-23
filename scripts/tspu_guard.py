@@ -379,10 +379,21 @@ def main() -> None:
     check_cert()
     check_contour()
 
+    # анти-ложняк: канал перепроверяем ещё раз через паузу, тревога — только если оба раза плохо
+    if any("сквозной канал" in p for p in problems):
+        print("   ЖДЁМ ПОДТВЕРЖДЕНИЯ: пауза 60 с и повторная проверка канала", flush=True)
+        time.sleep(60)
+        problems.clear()
+        check_cert()
+        check_contour()
+
     if problems:
         tg("⚠️ <b>Сторож ТСПУ: проблема</b>\n" + "\n".join("• " + p for p in problems))
-        print("АЛЕРТ отправлен")
-        sys.exit(1)
+        # красных прогонов не делаем: проблема уходит предупреждением, а не падением сборки
+        for p in problems:
+            print("::warning::" + p.replace("\n", " ")[:900], flush=True)
+        print("АЛЕРТ отправлен; выход 0 (сборка не падает)")
+        return
     print("всё в норме")
 
 
