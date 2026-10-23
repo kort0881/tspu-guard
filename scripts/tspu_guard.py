@@ -379,22 +379,22 @@ def main() -> None:
     check_cert()
     check_contour()
 
-    # анти-ложняк: канал перепроверяем ещё раз через паузу, тревога — только если оба раза плохо
-    if any("сквозной канал" in p for p in problems):
-        print("   ЖДЁМ ПОДТВЕРЖДЕНИЯ: пауза 60 с и повторная проверка канала", flush=True)
-        time.sleep(60)
-        problems.clear()
-        check_cert()
-        check_contour()
+    # сквозная проверка из CI ненадёжна (раннер Azure, чужой маршрут): это ИНФО, не тревога.
+    # В Telegram уходит только то, что действительно требует вмешательства: сертификат.
+    critical = [p for p in problems if "сквозной канал" not in p]
+    channel = [p for p in problems if "сквозной канал" in p]
 
-    if problems:
-        tg("⚠️ <b>Сторож ТСПУ: проблема</b>\n" + "\n".join("• " + p for p in problems))
-        # красных прогонов не делаем: проблема уходит предупреждением, а не падением сборки
-        for p in problems:
+    for p in channel:
+        print("::notice::канал (инфо, без тревоги): " + p.replace("\n", " ")[:900], flush=True)
+
+    if critical:
+        tg("⚠️ <b>Сторож ТСПУ: проблема</b>\n" + "\n".join("• " + p for p in critical))
+        for p in critical:
             print("::warning::" + p.replace("\n", " ")[:900], flush=True)
-        print("АЛЕРТ отправлен; выход 0 (сборка не падает)")
+        print("АЛЕРТ отправлен (только критичное); выход 0")
         return
-    print("всё в норме")
+
+    print("всё в норме" if not channel else "канал не подтвердился из CI — тревоги нет, это инфо")
 
 
 if __name__ == "__main__":
