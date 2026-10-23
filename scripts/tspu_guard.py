@@ -2,13 +2,15 @@
 """
 Сторож контура ТСПУ — запускается из GitHub Actions по расписанию.
 Проверяет: срок сертификата, сквозной канал (мост→выход) через SOCKS.
-При падении канала — триада диагностики (direct, bridge-reach,
-socks-tcp, plain-HTTP, TLS 1.2) и хвост лога xray в алерте.
+При падении канала — триада диагностики (direct, bridge-reach по
+CLIENT_JSON, socks-tcp, plain-HTTP, TLS 1.2) с классификацией RST/timeout,
+и хвост лога xray в алерте.
 
-Секреты (Settings → Secrets → Actions):
+Секреты:
   TG_TOKEN, TG_CHAT, CLIENT_JSON
-  DOMAIN, EXPECT_EXIT, TUNNEL_DOMAIN
+  DOMAIN, EXPECT_EXIT
 Опционально:
+  TUNNEL_DOMAIN — адрес моста (fallback, если из CLIENT_JSON не извлеклось)
   TUNNEL_PORT   — порт моста, по умолчанию 443
   SOCKS         — по умолчанию 127.0.0.1:10808
   XRAY_BIN      — по умолчанию xray
@@ -39,8 +41,6 @@ SOCKS         = os.getenv("SOCKS", "127.0.0.1:10808")
 XRAY_BIN      = os.getenv("XRAY_BIN", "xray")
 CERT_MIN_DAYS = int(os.getenv("CERT_MIN_DAYS", "7"))
 
-# Независимые источники «какой у меня IP»: сбой одного SNI на DPI не должен
-# выглядеть как падение контура.
 IP_ECHO = [
     "https://api.ipify.org",
     "https://icanhazip.com",
@@ -129,8 +129,6 @@ SOCKS_ERRORS = {
 
 
 def socks5_tcp_connect(host: str, port: int, timeout: int = 8) -> tuple[bool, str]:
-    """Может ли SOCKS5-прокси (xray) установить TCP до host:port.
-    DNS делает сторона прокси (ATYP=domain). -> (ok, err)."""
     socks_host, socks_port_s = SOCKS.split(":")
     try:
         s = socket.create_connection((socks_host, int(socks_port_s)), timeout=timeout)
@@ -197,40 +195,92 @@ def curl_direct(url: str, timeout: int = 10, want_body: bool = True,
     return _curl(url, ["-4"], timeout, want_body, tls_max)
 
 
-def diag_tunnel() -> str:
+def _classify_fail(err: str, code: str) -> str:
+    """Короткая метка причины сбоя curl — для чтения алерта без разбора."""
+    e = err.lower()
+    if "ssl_error_syscall" in e:
+        return "RST на TLS (DPI/обрыв)"
+    if "empty reply" in e:
+        return "RST на HTTP (DPI/обрыв)"
+    if "timed out" in e or "timeout" in e:
+        return "timeout (drop/blackhole — возможен MTU)"
+    if "connection refused" in e:
+        return "refused"
+    if "name or service" in e or "could not resolve" in e:
+        return "DNS fail"
+    if "connection reset" in e:
+        return "RST"
+    return f"code={code}" if code and code != "000" else (err[:60] or "unknown")
+
+
+def extract_servers(cfg: str) -> list[tuple[str, int]]:
+    """Best-effort: (host, port) из outbounds CLIENT_JSON (vnext/servers)."""
+    try:
+        data = json.loads(cfg)
+    except Exception:
+        return []
+    result: list[tuple[str, int]] = []
+    for ob in data.get("outbounds") or []:
+        st = ob.get("settings") or {}
+        for key in ("vnext", "servers"):
+            for e in st.get(key) or []:
+                addr, port = e.get("address"), e.get("port")
+                if addr and port:
+                    tup = (addr, int(port))
+                    if tup not in result:
+                        result.append(tup)
+    return result
+
+
+def _bridge_reach(cfg: str) -> str:
+    servers = extract_servers(cfg)
+    if servers:
+        host, port = servers[0]
+        label = f"bridge-reach {host}:{port}"
+    elif TUNNEL_DOMAIN:
+        host, port = TUNNEL_DOMAIN, TUNNEL_PORT
+        label = f"bridge-reach {host}:{port}"
+    else:
+        return "bridge-reach=SKIP (нет адреса)"
+
+    ok, err = _tcp_connect(host, port, timeout=5)
+    if ok:
+        return f"{label}=OK"
+    el = err.lower()
+    if "name or service" in el or "temporary failure" in el:
+        return f"{label}=SKIP (нет публичного DNS)"
+    return f"{label}=FAIL ({err[:60]})"
+
+
+def diag_tunnel(cfg: str) -> str:
     """
-    Пошаговая триада, чтобы отличить «мост мёртв» от «мост жив, но не форвардит»
-    и от «режут только TLS»:
-      1) direct     — у раннера вообще есть интернет;
-      2) bridge-reach — мост принимает TCP с раннера (если задан TUNNEL_DOMAIN);
-      3) socks-tcp  — xray может через мост дотянуться до target:443;
-      4) tunnel-http — данные проходят через туннель без TLS;
-      5) tunnel-tls1.2 — TLS 1.2 через туннель (отличает блок TLS 1.3).
+    Пошаговая триада, отличающая «мост мёртв» от «мост принимает TCP,
+    но данные не форвардит» и от «режут только TLS»:
+      1) direct        — у раннера вообще есть интернет;
+      2) bridge-reach  — мост принимает TCP (по адресу из CLIENT_JSON);
+      3) socks-tcp     — xray дотягивается до target:443 через мост;
+      4) tunnel-http   — данные проходят через туннель без TLS;
+      5) tunnel-tls1.2 — TLS 1.2 через туннель.
     """
     parts: list[str] = []
 
     code, body, err = curl_direct("https://api.ipify.org", timeout=8)
-    parts.append(f"direct OK ({body[:40]})"
-                 if code == "200" and body
-                 else f"direct FAIL ({err[:60] or 'code ' + code})")
+    parts.append(f"direct=OK ({body[:40]})" if code == "200" and body
+                 else f"direct=FAIL ({_classify_fail(err, code)})")
 
-    if TUNNEL_DOMAIN:
-        ok, err = _tcp_connect(TUNNEL_DOMAIN, TUNNEL_PORT, timeout=5)
-        parts.append("bridge-reach OK" if ok
-                     else f"bridge-reach FAIL ({err[:60]})")
+    parts.append(_bridge_reach(cfg))
 
     ok, err = socks5_tcp_connect("api.ipify.org", 443, timeout=8)
-    parts.append("socks-tcp:443 OK (TCP идёт)" if ok
-                 else f"socks-tcp:443 FAIL ({err[:60]})")
+    parts.append("socks-tcp:443=OK" if ok else f"socks-tcp:443=FAIL ({err[:60]})")
 
     code, body, err = curl_socks("http://api.ipify.org", timeout=8, want_body=True)
-    parts.append("tunnel-http OK (режут TLS)" if code == "200" and body
-                 else f"tunnel-http FAIL ({err[:60] or 'code ' + code})")
+    parts.append(f"tunnel-http=OK ({body[:40]})" if code == "200" and body
+                 else f"tunnel-http=FAIL ({_classify_fail(err, code)})")
 
     code, body, err = curl_socks("https://api.ipify.org", timeout=10,
                                  want_body=True, tls_max="1.2")
-    parts.append("tunnel-tls1.2 OK (режут только TLS 1.3)" if code == "200" and body
-                 else f"tunnel-tls1.2 FAIL ({err[:60] or 'code ' + code})")
+    parts.append(f"tunnel-tls1.2=OK ({body[:40]})" if code == "200" and body
+                 else f"tunnel-tls1.2=FAIL ({_classify_fail(err, code)})")
 
     return " || ".join(parts)
 
@@ -290,10 +340,10 @@ def check_contour() -> None:
         note(False,
              f"сквозной канал: выход=ПУСТО после {rounds} кругов по {len(IP_ECHO)} эхо "
              f"(ожидали {EXPECT_EXIT}) | " + "; ".join(last_errs[-3:])
-             + " || diag: " + diag_tunnel())
+             + " || diag: " + diag_tunnel(cfg))
     finally:
-        # Сначала останавливаем xray — дочерний Go-логгер сбрасывает буфер
-        # только на завершении. Читать лог раньше бессмысленно: хвост пуст.
+        # Останавливаем xray до чтения лога: Go-логгер сбрасывает буфер
+        # только на завершении процесса.
         if proc is not None:
             proc.terminate()
             try:
@@ -304,15 +354,18 @@ def check_contour() -> None:
                     proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     pass
-        # Хвост лога нужен только когда что-то упало — иначе шум в алерте.
+
+        # Хвост лога — только при проблемах, чтобы не шуметь в алерте.
         if problems:
             try:
                 log.flush(); log.seek(0)
                 tail = log.read()[-1200:].strip()
-            except Exception:
-                tail = ""
-            if tail:
-                problems.append("xray tail: " + tail.replace("\n", " ⏎ ")[:800])
+            except Exception as ex:
+                tail = f"(read error: {ex})"
+            if not tail:
+                tail = "(empty — loglevel в CLIENT_JSON может быть none/error, xray не пишет ошибок)"
+            problems.append("xray tail: " + tail.replace("\n", " ⏎ ")[:800])
+
         log.close()
         for path in (tmp.name, log.name):
             try:
